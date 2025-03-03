@@ -1,0 +1,411 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <EEPROM.h>
+#include <PubSubClient.h>
+
+// ====== CONFIGURE DEVELOPMENT OR PRODUCTION MODE =======
+#define DEVELOPMENT true  // Set to `false` for production
+#define DEV_MODE_FLAG_ADDR 200  // EEPROM Address to store Development Mode flag
+
+// ====== MQTT CONFIGURATION =======
+const char* mqttServer = "129.159.16.65";
+const int mqttPort = 1883;
+
+// ====== USER CONFIGURATION =======
+const char* userMobileNo = "8821861409";  // User's Mobile Number (Now used in MQTT topics)
+
+// ====== PIN CONFIGURATION =======
+const int relayPin = 5;  // GPIO5 (D1)
+const int ledPin = 2;    // GPIO2 (Built-in LED)
+
+// ====== STATE VARIABLES =======
+bool relayState = false;
+bool wifiConfigured = false;
+
+// ====== EEPROM VARIABLES =======
+String ssid, password;
+
+// ====== POWER MEASUREMENT VARIABLES (NOW SAVED TO EEPROM) =======
+float currentfactor = 0.0645;
+float defaultCurrent = 5.0;  // Default motor current in Amps
+float dryRunThreshold = 30.0;
+
+// ====== Power Measurement Variables =======
+float current = 0.0;
+float offset = 0.29;    // Sensor offset calibration
+int baseline = 20;      // Baseline reading for 0 A
+int sensorValue = 0;
+float voltage = 210.0;  // Voltage applied to load
+float wattage = 0.0;
+
+// ====== Dry Run Protection Variables =======
+bool dryRunDetected = false;
+unsigned long dryRunStartTime = 0;
+
+// ====== WIFI & SERVER CONFIGURATION =======
+ESP8266WebServer server(80);
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ====== MQTT TOPICS (Generated Dynamically) =======
+String controlTopic, statusTopic, powerTopic, alertTopic;
+
+/**
+ * Generate MQTT Topics Using userMobileNo
+ */
+void generateMQTTTopics() {
+  controlTopic = "user/" + String(userMobileNo) + "/motor/control";
+  statusTopic = "user/" + String(userMobileNo) + "/motor/status";
+  powerTopic = "user/" + String(userMobileNo) + "/motor/power";
+  alertTopic = "user/" + String(userMobileNo) + "/motor/alert";
+
+  Serial.println("MQTT Topics Updated:");
+  Serial.println("Control: " + controlTopic);
+  Serial.println("Status: " + statusTopic);
+  Serial.println("Power: " + powerTopic);
+  Serial.println("Alert: " + alertTopic);
+}
+
+/**
+ * Reads a string from EEPROM
+ */
+String readEEPROM(int start, int len) {
+  String data = "";
+  for (int i = start; i < start + len; i++) {
+    char c = EEPROM.read(i);
+    if (c == 0 || c == 255) break;
+    data += c;
+  }
+  return data;
+}
+
+/**
+ * Reads float values from EEPROM
+ */
+float readEEPROMFloat(int address) {
+  float value = 0.0;
+  EEPROM.get(address, value);
+  return value;
+}
+
+/**
+ * Writes float values to EEPROM
+ */
+void writeEEPROMFloat(int address, float value) {
+  EEPROM.put(address, value);
+  EEPROM.commit();
+}
+
+/**
+ * Writes a string to EEPROM
+ */
+void writeEEPROM(int start, String data) {
+  for (int i = 0; i < data.length(); i++) {
+    EEPROM.write(start + i, data[i]);
+  }
+  EEPROM.write(start + data.length(), 0);
+  EEPROM.commit();
+}
+
+/**
+ * Start Web Configuration Mode
+ */
+void startConfigMode() {
+  Serial.println("\nStarting Access Point...");
+
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  delay(1000);
+
+  // Set static IP for ESP8266 Access Point
+  IPAddress localIP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(localIP, gateway, subnet);
+
+  if (WiFi.softAP("Relay_Config", "12345678")) {
+    Serial.println("Access Point Started! Connect to 'Relay_Config'");
+  } else {
+    Serial.println("Failed to start Access Point!");
+  }
+
+  // Serve HTML configuration page
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", R"rawliteral(
+      <html><head><title>ESP8266 Config</title></head>
+      <body>
+      <h2>ESP8266 Configuration</h2>
+      <form action='/save' method='POST'>
+      WiFi SSID: <input type='text' name='ssid' value='Niketgroup5g'><br>
+      WiFi Password: <input type='password' name='password' value='12345678'><br>
+      Default Current (A): <input type='number' step='0.1' name='defaultCurrent' value='5.0'><br>
+      Dry Run Threshold (%): <input type='number' step='0.1' name='dryRunThreshold' value='30.0'><br>
+      <input type='submit' value='Save & Restart'>
+      </form>
+      </body></html>
+    )rawliteral");
+  });
+
+  // Handle form submission
+  server.on("/save", HTTP_POST, []() {
+    ssid = server.arg("ssid");
+    password = server.arg("password");
+    defaultCurrent = server.arg("defaultCurrent").toFloat();
+    dryRunThreshold = server.arg("dryRunThreshold").toFloat();
+
+    if (ssid.length() > 0 && password.length() > 0) {
+      writeEEPROM(0, ssid);
+      writeEEPROM(32, password);
+      writeEEPROMFloat(128, defaultCurrent);
+      writeEEPROMFloat(132, dryRunThreshold);
+
+      server.send(200, "text/plain", "Configuration Saved! Restarting...");
+      delay(1000);
+
+      if (!DEVELOPMENT) {
+        ESP.restart();
+      }
+    } else {
+      server.send(400, "text/plain", "Please enter valid WiFi credentials!");
+    }
+  });
+
+  server.begin();
+  Serial.println("Web Server Started: http://192.168.4.1/");
+}
+
+/**
+ * Connect to WiFi
+ */
+void setupWiFi() {
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  int timeout = 10;
+  while (WiFi.status() != WL_CONNECTED && timeout > 0) {
+    delay(1000);
+    Serial.print(".");
+    timeout--;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi Connection Failed! Switching to AP Mode...");
+    startConfigMode();
+  } else {
+    wifiConfigured = true;
+    Serial.println("\nWiFi Connected! IP: " + WiFi.localIP().toString());
+  }
+}
+
+
+/**
+ * MQTT Callback Function
+ * Handles incoming messages and controls relay
+ */
+void callback(char* topic, byte* payload, unsigned int length) {
+  String incomingTopic = String(topic);
+  String message;
+
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.print("Message received on topic: ");
+  Serial.println(incomingTopic);
+  Serial.print("Message: ");
+  Serial.println(message);
+
+  if (incomingTopic == controlTopic) {
+    if (message == "on") {
+      relayState = true;
+      digitalWrite(relayPin, LOW);  // Relay ON
+      digitalWrite(ledPin, LOW);    // LED ON
+      Serial.println("Relay turned ON");
+    } else if (message == "off") {
+      relayState = false;
+      digitalWrite(relayPin, HIGH); // Relay OFF
+      digitalWrite(ledPin, HIGH);   // LED OFF
+      Serial.println("Relay turned OFF");
+    }
+  }
+}
+
+/**
+ * Connect to MQTT Broker and Subscribe to Topics
+ */
+void reconnect() {
+  while (!client.connected()) {
+    Serial.println("Connecting to MQTT...");
+
+    // ✅ MQTT Last Will and Testament (LWT) - अगर डिवाइस अनएक्सपेक्टेड डिस्कनेक्ट हो जाए तो "offline" भेजेगा
+    if (client.connect("ESP8266Client", NULL, NULL, statusTopic.c_str(), 1, true, "offline")) {
+      Serial.println("MQTT Connected!");
+
+      // ✅ Subscribe to Control Topic
+      client.subscribe(controlTopic.c_str());
+      Serial.println("Subscribed to: " + controlTopic);
+
+      // ✅ जब कनेक्ट हो जाए, तो "online" स्टेटस भेजें
+      client.publish(statusTopic.c_str(), "online", true); // Retain flag true
+    } else {
+      Serial.print("MQTT Connection Failed, Retrying in 5s...");
+      delay(5000);
+    }
+  }
+}
+
+
+void updateDeviceStatus(bool isConnected) {
+  if (isConnected) {
+    client.publish(statusTopic.c_str(), "online", true);  // ✅ Online स्टेटस पब्लिश करें
+  } else {
+    client.publish(statusTopic.c_str(), "offline", true); // ✅ Offline स्टेटस भेजें (अगर मैन्युअली डिस्कनेक्ट होता है)
+  }
+}
+
+
+/**
+ * Measure power consumption and handle dry run protection
+ */
+void measurePower() {
+  sensorValue = 0;
+
+  // Sample the highest value from A0 over 500 readings
+  for (int i = 0; i < 500; i++) {
+    int reading = analogRead(A0);
+    if (reading > sensorValue) sensorValue = reading;
+    delay(5);
+  }
+
+  // Adjust sensor value based on baseline
+  sensorValue -= baseline;
+  if (sensorValue < 0) sensorValue = 0;
+
+  // Convert to current and wattage
+  current = (sensorValue * currentfactor) - offset;
+  if (current < 0) current = 0;
+  wattage = current * voltage;
+
+  float thresholdCurrent = defaultCurrent * (1 - dryRunThreshold / 100.0);
+
+  // Dry run detection logic
+  if (current < thresholdCurrent) {
+    if (!dryRunDetected) {
+      dryRunDetected = true;
+      dryRunStartTime = millis();
+      Serial.println("⚠️ Dry run detected! Waiting 30s...");
+    } else if (millis() - dryRunStartTime >= 30000) {
+      relayState = false;
+      digitalWrite(relayPin, HIGH); // Relay OFF
+      digitalWrite(ledPin, HIGH);   // LED OFF
+      Serial.println("⛔ Dry run confirmed. Relay OFF!");
+
+       // ✅ Publish "off" to MQTT control topic
+      client.publish(controlTopic.c_str(), "off", true);
+      Serial.println("📡 MQTT Update: Published 'off' to control topic");
+      
+      dryRunDetected = false;
+    }
+  } else {
+    dryRunDetected = false;
+    dryRunStartTime = 0;
+  }
+
+  // Debug output
+  Serial.print("Current: "); Serial.print(current); Serial.print(" A, ");
+  Serial.print("Wattage: "); Serial.print(wattage); Serial.println(" W");
+}
+
+/**
+ * Check if the device is booting into DEVELOPMENT Mode for the first time.
+ */
+bool isFirstBootInDevelopment() {
+  return EEPROM.read(DEV_MODE_FLAG_ADDR) != 1;  // Returns true if the flag is NOT set
+}
+
+/**
+ * Mark that DEVELOPMENT Mode has already been entered once.
+ */
+void markDevelopmentBootCompleted() {
+  EEPROM.write(DEV_MODE_FLAG_ADDR, 1);  // Write flag to EEPROM
+  EEPROM.commit();
+}
+
+/**
+ * Setup Function
+ */
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(512);
+
+ // ✅ Check if this is the first DEVELOPMENT Mode boot
+  if (DEVELOPMENT && isFirstBootInDevelopment()) {
+    Serial.println("🔧 DEVELOPMENT MODE: First Boot → Entering Web Config Mode...");
+    startConfigMode();
+    markDevelopmentBootCompleted();  // ✅ Save flag so it doesn't enter again
+
+    while (true) {  // **Prevent further execution in DEVELOPMENT mode**
+      server.handleClient();
+      delay(100);  
+    }
+  }
+
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, HIGH);
+
+  // Read stored credentials from EEPROM
+  ssid = readEEPROM(0, 32);
+  password = readEEPROM(32, 32);
+  defaultCurrent = readEEPROMFloat(128);
+  dryRunThreshold = readEEPROMFloat(132);
+
+  generateMQTTTopics(); // Generate MQTT topics using userMobileNo
+
+  // ✅ If WiFi credentials are missing, start Config Mode
+  if (ssid.length() == 0 || password.length() == 0) {
+    Serial.println("⚠️ No WiFi credentials found! Starting in AP mode...");
+    startConfigMode();
+    
+    while (true) {  // **Prevent further execution in AP mode until user configures WiFi**
+      server.handleClient();
+      delay(100);
+    }
+  } else {
+    setupWiFi();
+  }
+
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(callback); // ✅ Set MQTT callback
+}
+
+
+
+/**
+ * Main Loop
+ */
+void loop() {
+  // Auto-reconnect WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi Disconnected! Reconnecting...");
+    updateDeviceStatus(false); // ✅ Offline स्टेटस भेजें
+    setupWiFi();
+  }
+
+ if (wifiConfigured) {
+    if (!client.connected()) {
+      updateDeviceStatus(false); // ✅ Disconnect पर स्टेटस अपडेट करें
+      reconnect();
+    }
+    client.loop();
+  }
+
+  server.handleClient();  // ✅ Web server request handling
+
+  // ✅ Measure power when relay is ON
+  if (relayState) measurePower();
+
+  delay(500); // ✅ Ensures non-blocking behavior
+  
+}
